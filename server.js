@@ -17,14 +17,21 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
-// Use SQLite if no DATABASE_URL; otherwise use PostgreSQL
+// Use SQLite if no DATABASE_URL; otherwise use PostgreSQL.
+// Render-hosted Postgres requires TLS, so we enable ssl for any remote URL.
+// For localhost Postgres (or any URL containing 'localhost' / '127.0.0.1')
+// we leave ssl off so local dev doesn't need certs.
 let pool;
 const dbUrl = process.env.DATABASE_URL;
 if (!dbUrl || dbUrl.startsWith('sqlite')) {
   const localDb = require('./db');
   pool = localDb;
 } else {
-  pool = new Pool({ connectionString: dbUrl, ssl: false });
+  const isLocalDb = /localhost|127\.0\.0\.1/.test(dbUrl);
+  pool = new Pool({
+    connectionString: dbUrl,
+    ssl: isLocalDb ? false : { rejectUnauthorized: false },
+  });
 }
 const { getDb } = require('./db');
 
