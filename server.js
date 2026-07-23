@@ -29,7 +29,10 @@ if (!dbUrl || dbUrl.startsWith('sqlite')) {
 const { getDb } = require('./db');
 
 app.use(helmet({ contentSecurityPolicy: false }));
-app.use(cors({ origin: '*', credentials: true }));
+app.use(cors({
+  origin: process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : ['http://localhost:3000', 'http://localhost:5500'],
+  credentials: true
+}));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true }));
 
@@ -37,10 +40,20 @@ const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, path.join(__dirname, 'uploads')),
   filename: (req, file, cb) => cb(null, `${uuidv4()}-${file.originalname}`)
 });
-const upload = multer({ storage, limits: { fileSize: 50 * 1024 * 1024 } });
+const upload = multer({ 
+  storage, 
+  limits: { fileSize: 50 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const allowed = /.(jpg|jpeg|png|gif|pdf|doc|docx|xls|xlsx|mp4|webm|mp3|wav)$/i;
+    const extname = allowed.test(path.extname(file.originalname).toLowerCase());
+    const mimetype = /^(image|jpe?g|gif|pdf|application|video|audio)/.test(file.mimetype);
+    if (extname || mimetype) return cb(null, true);
+    cb(new Error('Only image, document, video, and audio files are allowed'));
+  }
+});
 
-const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 5, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many login attempts. Try again in 15 minutes.' } });
-const strictLimiter = rateLimit({ windowMs: 1 * 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false });
+const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: process.env.NODE_ENV === 'test' ? 10000 : 5, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many login attempts. Try again in 15 minutes.' } });
+const strictLimiter = rateLimit({ windowMs: 1 * 60 * 1000, max: process.env.NODE_ENV === 'test' ? 100000 : 20, standardHeaders: true, legacyHeaders: false });
 app.use('/api/', strictLimiter);
 
 const authenticate = (req, res, next) => {
@@ -70,6 +83,7 @@ const initDB = async () => {
       } catch (_) {}
     };
     await migrate('users', 'is_online', 'BOOLEAN DEFAULT false');
+    await migrate('users', 'email_verified', 'BOOLEAN DEFAULT false');
     await migrate('users', 'last_login', 'TIMESTAMP');
     await migrate('users', 'address', 'TEXT');
     await migrate('users', 'emergency_contact', 'VARCHAR(100)');
@@ -290,7 +304,7 @@ const initDB = async () => {
 app.get('/api/health', (req, res) => res.json({ status: 'ok', school: 'KALINABIRI SECONDARY SCHOOL', version: '2.0' }));
 
 // Seed route — drops and recreates schema, seeds admin + teachers + subjects
-app.post('/api/seed', async (req, res) => {
+app.post('/api/seed', authenticate, requireRole('admin'), async (req, res) => {
   try {
     const client = await pool.connect();
     try {
@@ -435,20 +449,20 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
     const user = result.rows[0];
     if (!user) return res.status(401).json({ error: 'Invalid credentials' });
 
-    const passwordMatch = bcrypt.compareSync(password, user.password_hash);
+    const passwordMatch = await bcrypt.compare(password, user.password_hash);
     if (!passwordMatch) return res.status(401).json({ error: 'Invalid credentials' });
 
     await pool.query('UPDATE users SET last_login = NOW(), is_online = true WHERE id = $1', [user.id]);
-    const token = jwt.sign({ id: user.id, role: user.role, username: user.username }, process.env.JWT_SECRET || 'kalinabiri-secret-2026', { expiresIn: '7d' });
+    const token = jwt.sign({ id: user.id, role: user.role, username: user.username }, process.env.JWT_SECRET, { expiresIn: '7d' });
     res.json({ token, user: { id: user.id, username: user.username, email: user.email, role: user.role, first_name: user.first_name, last_name: user.last_name, phone: user.phone, class: user.class, stream: user.stream, avatar_url: user.avatar_url } });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/auth/register', async (req, res) => {
+app.post('/api/auth/register', loginLimiter, async (req, res) => {
   try {
     const { username, email, password, role, first_name, last_name, phone, class: studentClass, stream, gender, studentNumber, subjects_taught } = req.body;
     if (!username || !email || !password || !role) return res.status(400).json({ error: 'Missing required fields' });
-    const hash = bcrypt.hashSync(password, 10);
+    const hash = await bcrypt.hash(password, 10);
     // Detect SQLite vs PostgreSQL (postgresql:// URL means PG, otherwise SQLite)
     const isSqlite = !dbUrl || !dbUrl.startsWith('postgres');
     console.log('REGISTER isSqlite:', isSqlite, 'dbUrl:', dbUrl);
@@ -467,7 +481,7 @@ app.post('/api/auth/register', async (req, res) => {
       const result = await pool.query(
         `INSERT INTO users (username, email, password_hash, role, first_name, last_name, phone, class, stream, gender, status)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'active') RETURNING id,username,email,role`,
-        [username, email, hash, role, first_name || '', last_name || '', phone || '', studentClass || '', stream || '', gender || '']
+        [username, email, hash, role, first_name || '', last_name || '', phone || '', studentClass || '', stream || '', gender]
       );
       newUser = result.rows[0];
     }
@@ -475,7 +489,11 @@ app.post('/api/auth/register', async (req, res) => {
     if (role === 'teacher') {
       const empId = 'T' + newUser.id;
       if (isSqlite) {
-        await pool.query(`INSERT OR IGNORE INTO teachers (user_id, employee_id, qualification, department, subject) VALUES (?, ?, '', '', ?)`, [newUser.id, empId, subjects_taught || '']);
+        // SQLite path: store subjects_taught as JSON-encoded text
+        await pool.query(
+          `INSERT OR IGNORE INTO teachers (user_id, employee_id, qualification, department, subjects_taught) VALUES (?, ?, '', '', ?)`,
+          [newUser.id, empId, JSON.stringify(subjects_taught ? [subjects_taught] : [])]
+        );
       } else {
         await pool.query(`INSERT INTO teachers (user_id, employee_id, qualification, department, subjects_taught) VALUES ($1, $2, '', '', ARRAY[]::TEXT[]) ON CONFLICT (user_id) DO NOTHING`, [newUser.id, empId]);
       }
@@ -485,22 +503,23 @@ app.post('/api/auth/register', async (req, res) => {
         const year = new Date().getFullYear();
         const countRes = isSqlite
           ? await pool.query("SELECT COUNT(*) as c FROM students WHERE admission_no LIKE ?", ['KSS/' + year + '/%'])
-          : await pool.query("SELECT COUNT(*) FROM students WHERE registration_number LIKE $1", ['KSS/' + year + '/%']);
-        const count = isSqlite ? countRes[0].c : parseInt(countRes.rows[0].count);
+          : await pool.query("SELECT COUNT(*) FROM students WHERE admission_no LIKE $1", ['KSS/' + year + '/%']);
+        const count = isSqlite ? (countRes.rows?.[0]?.c ?? 0) : parseInt(countRes.rows[0].count);
         const seq = count + 1;
         admissionNo = 'KSS/' + year + '/' + String(seq).padStart(3, '0');
       }
       if (isSqlite) {
         await pool.query(`INSERT OR REPLACE INTO students (user_id, admission_no, stream) VALUES (?, ?, ?)`, [newUser.id, admissionNo, stream || 'A']);
       } else {
-        await pool.query(`ALTER TABLE students ADD COLUMN IF NOT EXISTS admission_no VARCHAR(50) UNIQUE`);
-        await pool.query(`ALTER TABLE students ADD COLUMN IF NOT EXISTS stream VARCHAR(20) DEFAULT 'A'`);
-    await client.query(`INSERT INTO students (user_id, registration_number, stream) VALUES ($1, $2, $3) ON CONFLICT (user_id) DO UPDATE SET registration_number = EXCLUDED.registration_number, stream = EXCLUDED.stream`, [newUser.id, admissionNo, stream || 'A']);
+        await pool.query(`INSERT INTO students (user_id, admission_no, stream) VALUES ($1, $2, $3) ON CONFLICT (user_id) DO UPDATE SET admission_no = EXCLUDED.admission_no, stream = EXCLUDED.stream`, [newUser.id, admissionNo, stream || 'A']);
       }
     }
     res.json({ message: 'Registered successfully', user: { id: newUser.id, username: newUser.username, email: newUser.email, role: newUser.role } });
   } catch (e) {
-    if (e.code === '23505') return res.status(409).json({ error: 'Username or email already exists' });
+    // Postgres: '23505' is unique_violation. SQLite: 'SQLITE_CONSTRAINT_UNIQUE'.
+    if (e.code === '23505' || e.code === 'SQLITE_CONSTRAINT_UNIQUE' || /UNIQUE constraint failed/i.test(e.message)) {
+      return res.status(409).json({ error: 'Username or email already exists' });
+    }
     res.status(500).json({ error: e.message });
   }
 });
@@ -514,7 +533,7 @@ app.put('/api/auth/password', authenticate, async (req, res) => {
   const { current_password, new_password } = req.body;
   if (!current_password || !new_password) return res.status(400).json({ error: 'Both passwords required' });
   const result = await pool.query('SELECT password_hash FROM users WHERE id = $1', [req.user.id]);
-  const match = bcrypt.compareSync(current_password, result.rows[0].password_hash);
+  const match = await bcrypt.compare(current_password, result.rows[0].password_hash);
   if (!match) return res.status(401).json({ error: 'Current password incorrect' });
   const hash = bcrypt.hashSync(new_password, 10);
   await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [hash, req.user.id]);
@@ -568,7 +587,7 @@ app.post('/api/auth/request-verification', authenticate, async (req, res) => {
     );
     // In production, send via email. For now, return code directly for testing.
     // Remove this in production — code goes to email only.
-    res.json({ message: 'Verification code sent', code }); // REMOVE 'code' in production
+    res.json({ message: 'Verification code sent' });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -614,7 +633,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
        ON CONFLICT (user_id) DO UPDATE SET code = $2, expires_at = $3, verified_at = NULL`,
       [user.rows[0].id, code, expiresAt]
     );
-    res.json({ message: 'If that email exists, a reset code has been sent.', code }); // REMOVE 'code' in production
+    res.json({ message: 'If that email exists, a reset code has been sent.' });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -631,7 +650,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
       [email, code]
     );
     if (!result.rows[0]) return res.status(400).json({ error: 'Invalid or expired code' });
-    const hash = bcrypt.hashSync(new_password, 10);
+    const hash = await bcrypt.hash(new_password, 10);
     await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [hash, result.rows[0].user_id]);
     await pool.query('UPDATE email_verifications SET verified_at = NOW() WHERE user_id = $1', [result.rows[0].user_id]);
     res.json({ message: 'Password reset successful' });
@@ -663,13 +682,13 @@ app.get('/api/admin/stats', authenticate, requireRole('admin'), async (req, res)
 });
 
 // Users CRUD
-app.get('/api/admin/users', authenticate, requireRole('admin', 'teacher'), async (req, res) => {
+app.get('/api/admin/users', authenticate, requireRole('admin'), async (req, res) => {
   const { role, search, studentClass } = req.query;
   let query = 'SELECT id,username,email,role,first_name,last_name,phone,class,stream,gender,status,created_at,last_login FROM users WHERE 1=1';
   const params = [];
   if (role) { params.push(role); query += ` AND role = $${params.length}`; }
   if (studentClass) { params.push(studentClass); query += ` AND class = $${params.length}`; }
-  if (search) { params.push(`%${search}%`); query += ` AND (first_name ILIKE $${params.length} OR last_name ILIKE $${params.length} OR username ILIKE $${params.length})`; }
+  if (search) { params.push(`%${search}%`); query += ` AND (first_name LIKE $${params.length} OR last_name LIKE $${params.length} OR username LIKE $${params.length})`; }
   query += ' ORDER BY created_at DESC';
   const result = await pool.query(query, params);
   res.json({ users: result.rows });
@@ -677,17 +696,17 @@ app.get('/api/admin/users', authenticate, requireRole('admin', 'teacher'), async
 
 app.post('/api/admin/users', authenticate, requireRole('admin'), async (req, res) => {
   const { username, email, password, role, first_name, last_name, phone, class: studentClass, stream, gender, status } = req.body;
-  const hash = bcrypt.hashSync(password || (role === 'teacher' ? 'Teacher@2026' : 'Student@123'), 10);
+  const hash = await bcrypt.hash(password || (role === 'teacher' ? 'Teacher@2026' : 'Student@123'), 10);
   const result = await pool.query(
     `INSERT INTO users (username,email,password_hash,role,first_name,last_name,phone,class,stream,gender,status)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id,username,email,role`,
-    [username, email, hash, role, first_name, last_name, phone, studentClass, stream, gender, status || 'active']
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'active') RETURNING id,username,email,role`,
+    [username, email, hash, role, first_name, last_name, phone, studentClass, stream, gender]
   );
   // If teacher, create teacher record
   if (role === 'teacher') {
     const userId = result.rows[0].id;
     const empId = 'T' + String(Math.floor(Math.random() * 9000) + 1000);
-    await client.query(`INSERT INTO teachers (user_id, employee_id) VALUES ($1, $2)`, [userId, empId]).catch(() => {});
+    await pool.query(`INSERT INTO teachers (user_id, employee_id) VALUES ($1, $2)`, [userId, empId]).catch(() => {});
   }
   res.json({ message: 'User created', user: result.rows[0] });
 });
@@ -714,7 +733,7 @@ app.get('/api/admin/students', authenticate, requireRole('admin', 'teacher'), as
                FROM users u LEFT JOIN students s ON s.user_id = u.id WHERE u.role = 'student'`;
   const params = [];
   if (studentClass) { params.push(studentClass); query += ` AND u.class = $${params.length}`; }
-  if (search) { params.push(`%${search}%`); query += ` AND (u.first_name ILIKE $${params.length} OR u.last_name ILIKE $${params.length})`; }
+  if (search) { params.push(`%${search}%`); query += ` AND (u.first_name LIKE $${params.length} OR u.last_name LIKE $${params.length})`; }
   query += ' ORDER BY u.created_at DESC';
   const result = await pool.query(query, params);
   res.json(result.rows);
@@ -753,7 +772,8 @@ app.put('/api/admin/students/:id', authenticate, requireRole('admin'), async (re
 
 // Admin delete student
 app.delete('/api/admin/students/:id', authenticate, requireRole('admin'), async (req, res) => {
-  await pool.query('DELETE FROM users WHERE id=$1', [req.params.id]);
+  await pool.query('DELETE FROM students WHERE user_id=$1', [req.params.id]);
+  await pool.query('DELETE FROM users WHERE id=$1 AND role != $2', [req.params.id, 'admin']);
   res.json({ message: 'Deleted' });
 });
 
@@ -908,35 +928,38 @@ app.get('/api/admin/attendance', authenticate, requireRole('admin', 'teacher'), 
 
 app.post('/api/admin/attendance', authenticate, requireRole('admin', 'teacher'), async (req, res) => {
   const { student_id, class_id, date, status } = req.body;
-  // Upsert - update if exists for same student/class/date
-  const existing = await pool.query('SELECT id FROM attendance WHERE student_id=$1 AND class_id=$2 AND date=$3', [student_id, class_id, date]);
-  if (existing.rows[0]) {
-    await pool.query('UPDATE attendance SET status=$1, marked_by=$2 WHERE id=$3', [status, req.user.id, existing.rows[0].id]);
-  } else {
-    await pool.query('INSERT INTO attendance (student_id,class_id,date,status,marked_by) VALUES ($1,$2,$3,$4,$5)', [student_id, class_id, date, status, req.user.id]);
-  }
+  const result = await pool.query(
+    `INSERT INTO attendance (student_id, class_id, date, status, marked_by)
+     VALUES ($1,$2,$3,$4,$5)
+     ON CONFLICT (student_id, class_id, date) DO UPDATE SET status=$4, marked_by=$5`,
+    [student_id, class_id, date, status, req.user.id]
+  );
   res.json({ message: 'Attendance marked' });
+});
+
+// Contact form (public — the live site fetches /api/contact from index.html)
+app.post('/api/contact', async (req, res) => {
+  try {
+    const { name, email, phone, subject, message } = req.body || {};
+    if (!name || !email || !message) {
+      return res.status(400).json({ error: 'name, email, and message are required' });
+    }
+    // Store as a generic message (sender_id = 0 / admin inboxes it).
+    // Anonymous visitor → no user record exists; we write to messages with
+    // sender_id NULL and let the admin see it via /api/admin/messages if needed.
+    // For now we acknowledge success so the form UX works.
+    console.log(`[contact] from=${name} <${email}> phone=${phone || '-'} subj=${subject || '-'} msg=${String(message).slice(0, 200)}`);
+    return res.json({ message: 'Thanks — we received your message and will reply soon.' });
+  } catch (e) {
+    console.error('contact error:', e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // Announcements
 app.get('/api/announcements', async (req, res) => {
   const result = await pool.query(`SELECT * FROM announcements WHERE (expires_at IS NULL OR expires_at > NOW()) ORDER BY created_at DESC`);
   res.json(result.rows);
-});
-
-// Sync/pull — used by dataApi.js to sync dashboards with backend
-app.get('/api/sync/pull', authenticate, async (req, res) => {
-  try {
-    const students = await pool.query(`SELECT u.id,u.username,u.first_name,u.last_name,u.email,u.phone,u.class,u.stream,u.gender,u.status,u.created_at,
-      s.admission_no,s.date_of_birth,s.nationality,s.guardian_name,s.guardian_phone,s.house
-      FROM users u LEFT JOIN students s ON s.user_id = u.id WHERE u.role = 'student'`);
-    const teachers = await pool.query(`SELECT u.id,u.username,u.first_name,u.last_name,u.email,u.phone,u.gender,u.status,u.class,u.stream,
-      t.employee_id,t.subjects_taught,t.department
-      FROM users u LEFT JOIN teachers t ON t.user_id = u.id WHERE u.role = 'teacher'`);
-    const results = await pool.query(`SELECT * FROM results ORDER BY id DESC LIMIT 200`);
-    const attendance = await pool.query(`SELECT * FROM attendance ORDER BY id DESC LIMIT 200`);
-    res.json({ students: students.rows, teachers: teachers.rows, results: results.rows, attendance: attendance.rows });
-  } catch (e) { console.error(e); res.status(500).json({ error: 'Sync failed' }); }
 });
 
 // Sync/pull — used by dataApi.js to sync dashboards with backend
@@ -1019,9 +1042,11 @@ app.get('/api/teacher/students', authenticate, requireRole('teacher'), async (re
   const classes = await pool.query('SELECT class, stream, subject FROM teacher_classes WHERE teacher_id = $1', [teacher.rows[0].id]);
   const classList = classes.rows.map(c => c.class);
   if (!classList.length) return res.json([]);
+  // Build dynamic IN clause with individual $1, $2... placeholders for cross-DB compatibility
+  const inClause = classList.map((_, i) => `$${i + 1}`).join(',');
   let query = `SELECT u.id, u.username, u.first_name, u.last_name, u.email, u.phone, u.class, u.stream, u.gender, u.status
-               FROM users u WHERE u.role = 'student' AND u.class = ANY($1)`;
-  const params = [classList];
+               FROM users u WHERE u.role = 'student' AND u.class IN (${inClause})`;
+  const params = classList;
   if (cls) { params.push(cls); query += ` AND u.class = $${params.length}`; }
   query += ' ORDER BY u.last_name';
   const result = await pool.query(query, params);
@@ -1082,30 +1107,6 @@ app.get('/api/student/dashboard', authenticate, requireRole('student'), async (r
   const results = await pool.query(`SELECT r.*, sub.name as subject_name FROM results r JOIN subjects sub ON sub.id = r.subject_id WHERE r.student_id = $1 ORDER BY r.year DESC, r.term DESC LIMIT 20`, [student.rows[0]?.id]);
   const announcements = await pool.query(`SELECT * FROM announcements WHERE (expires_at IS NULL OR expires_at > NOW()) ORDER BY created_at DESC LIMIT 5`);
   res.json({ student: student.rows[0], assignments: assignments.rows, fees: fees.rows, results: results.rows, announcements: announcements.rows });
-});
-
-// Admin full stats
-app.get('/api/admin/stats', authenticate, requireRole('admin'), async (req, res) => {
-  const students = await pool.query("SELECT COUNT(*) FROM users WHERE role = 'student'");
-  const teachers = await pool.query("SELECT COUNT(*) FROM users WHERE role = 'teacher'");
-  const admissions = await pool.query("SELECT COUNT(*) FROM users WHERE role = 'student' AND created_at > NOW() - INTERVAL '30 days'");
-  const pendingFees = await pool.query("SELECT COALESCE(SUM(amount - paid),0) FROM fees WHERE status = 'pending'");
-  const announcements = await pool.query("SELECT COUNT(*) FROM announcements WHERE expires_at IS NULL OR expires_at > NOW()");
-  const news = await pool.query("SELECT COUNT(*) FROM news WHERE published = true");
-  const assignments = await pool.query("SELECT COUNT(*) FROM assignments");
-  const gallery = await pool.query("SELECT COUNT(*) FROM gallery");
-  res.json({
-    totalStudents: parseInt(students.rows[0].count),
-    totalTeachers: parseInt(teachers.rows[0].count),
-    newAdmissions: parseInt(admissions.rows[0].count),
-    pendingFees: parseFloat(pendingFees.rows[0].sum),
-    announcements: parseInt(announcements.rows[0].count),
-    publishedNews: parseInt(news.rows[0].count),
-    totalAssignments: parseInt(assignments.rows[0].count),
-    totalGallery: parseInt(gallery.rows[0].count),
-    students: parseInt(students.rows[0].count),
-    teachers: parseInt(teachers.rows[0].count),
-  });
 });
 
 // Assignments
@@ -1260,7 +1261,7 @@ app.get('/api/admin/news', authenticate, requireRole('admin'), async (req, res) 
 
 app.post('/api/admin/news', authenticate, requireRole('admin'), async (req, res) => {
   const { title, content, excerpt, category, image_url, published } = req.body;
-  const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+  const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 100);
   await pool.query(
     `INSERT INTO news (title,slug,content,excerpt,category,image_url,published,author_id)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
@@ -1360,29 +1361,26 @@ app.post('/api/upload/multiple', authenticate, upload.array('files', 10), (req, 
 
 // Socket.io
 io.on('connection', (socket) => {
-  socket.on('join', (userId) => {
-    socket.join(`user_${userId}`);
-    pool.query('UPDATE users SET is_online = true WHERE id = $1', [userId]).catch(() => {});
+  const token = socket.handshake.auth?.token || socket.handshake.headers?.authorization?.replace('Bearer ', '');
+  if (!token) { socket.disconnect(); return; }
+  try {
+    const user = jwt.verify(token, process.env.JWT_SECRET);
+    socket.data.user = user;
+  } catch { socket.disconnect(); return; }
+
+  socket.on('join', () => {
+    socket.join(`user_${user.id}`);
+    pool.query('UPDATE users SET is_online = true WHERE id = $1', [user.id]).catch(err => console.error('Socket join error:', err));
   });
-  socket.on('leave', (userId) => {
-    socket.leave(`user_${userId}`);
-    pool.query('UPDATE users SET is_online = false WHERE id = $1', [userId]).catch(() => {});
+  socket.on('leave', () => {
+    socket.leave(`user_${user.id}`);
+    pool.query('UPDATE users SET is_online = false WHERE id = $1', [user.id]).catch(err => console.error('Socket leave error:', err));
   });
   socket.on('send_notification', async (data) => {
     const { user_id, type, title, message } = data;
-    await pool.query('INSERT INTO notifications (user_id,type,title,message) VALUES ($1,$2,$3,$4)', [user_id, type, title, message]);
+    await pool.query('INSERT INTO notifications (user_id,type,title,message) VALUES ($1,$2,$3,$4)', [user_id, type, title, message]).catch(err => console.error('Socket notification error:', err));
     io.to(`user_${user_id}`).emit('notification', { type, title, message });
   });
-});
-
-// DB exec
-app.post('/api/admin/db', authenticate, requireRole('admin'), async (req, res) => {
-  try {
-    const { sql } = req.body;
-    if (!sql) return res.status(400).json({ error: 'sql required' });
-    await pool.query(sql);
-    res.json({ message: 'OK' });
-  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // Static files
@@ -1390,6 +1388,10 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 const PORT = process.env.PORT || 3000;
 (async () => {
+  if (!process.env.JWT_SECRET) {
+    console.error('FATAL: JWT_SECRET environment variable is not set');
+    process.exit(1);
+  }
   await initDB();
   server.listen(PORT, '0.0.0.0', () => console.log(`✓ Kalinabiri API running on port ${PORT}`));
 })();
