@@ -143,25 +143,37 @@ async function run() {
 
     // ── Login flows ────────────────────────────────────────────
     // Admin default creds: on Postgres init = Admin@2026, on SQLite = random 12-char.
-    // To make this test stable on SQLite we register a known admin via the register
-    // route (role='admin' is allowed server-side). If that's blocked, we'll fall
-    // back to fishing the seeded pw from boot output.
+    // SECURITY: self-registration no longer allows role=admin. To get an admin
+    // token for the smoke test we register a known teacher, then SQL-update
+    // that user's role to admin via the SQLite wrapper. (On Postgres this
+    // wouldn't work; the smoke test runs against SQLite only by design.)
     const adminReg = await call('POST', '/api/auth/register', {
       username: 'testadmin', email: 'testadmin@kal.com', password: 'Admin@2026',
-      role: 'admin', first_name: 'Test', last_name: 'Admin',
+      role: 'teacher', first_name: 'Test', last_name: 'Admin',
     });
     let adminLogin;
-    if (adminReg.status === 200) {
-      adminLogin = await call('POST', '/api/auth/login', { username: 'testadmin', password: 'Admin@2026' });
-    } else {
-      // register may have rejected role='admin' for non-secure reasons; skip
-      adminLogin = { status: 0, json: { error: 'cannot bootstrap admin' } };
-    }
-    if (adminLogin.status !== 200) {
+    if (adminReg.status !== 200) {
       record('Bootstrap admin via register', false,
-        'register role=admin returned ' + adminReg.status + ' — ' + JSON.stringify(adminReg.json));
+        'register role=teacher returned ' + adminReg.status + ' — ' + JSON.stringify(adminReg.json));
     } else {
-      record('Bootstrap admin via register + login', true);
+      // Promote via SQLite. We use the server's own node_modules.
+      try {
+        const Database = require(require.resolve('better-sqlite3', { paths: [__dirname] }));
+        const path = require('path');
+        const dbPath = path.join(__dirname, 'kalinabiri.db');
+        const d = new Database(dbPath);
+        d.prepare("UPDATE users SET role='admin' WHERE username='testadmin'").run();
+        d.close();
+      } catch (e) {
+        console.error('Failed to promote testadmin to admin:', e.message);
+      }
+      adminLogin = await call('POST', '/api/auth/login', { username: 'testadmin', password: 'Admin@2026' });
+      if (adminLogin.status !== 200) {
+        record('Bootstrap admin via register + promote + login', false,
+          'login returned ' + adminLogin.status + ' — ' + JSON.stringify(adminLogin.json));
+      } else {
+        record('Bootstrap admin via register + promote + login', true);
+      }
     }
     const adminToken = adminLogin.json && adminLogin.json.token;
 

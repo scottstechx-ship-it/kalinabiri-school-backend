@@ -219,12 +219,135 @@ function initTables() {
       UNIQUE(student_id, class, stream, year, term)
     );
     CREATE TABLE IF NOT EXISTS activities (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER REFERENCES users(id),
-      action TEXT, entity_type TEXT, entity_id INTEGER,
-      details TEXT,         -- JSONB modelled as TEXT on SQLite
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id INTEGER REFERENCES users(id),
+          action TEXT, entity_type TEXT, entity_id INTEGER,
+          details TEXT,         -- JSONB modelled as TEXT on SQLite
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- Communication Platform Tables
+        CREATE TABLE IF NOT EXISTS conversations (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          school_id INTEGER DEFAULT 1,
+          type TEXT NOT NULL, -- 'direct', 'group', 'class', 'announcement'
+          name TEXT,
+          description TEXT,
+          created_by INTEGER REFERENCES users(id),
+          is_archived INTEGER DEFAULT 0,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS conversation_members (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          conversation_id INTEGER REFERENCES conversations(id) ON DELETE CASCADE,
+          user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+          role TEXT DEFAULT 'member', -- 'admin', 'moderator', 'member'
+          joined_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          last_read_at DATETIME,
+          is_muted INTEGER DEFAULT 0,
+          UNIQUE(conversation_id, user_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS messages (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          conversation_id INTEGER REFERENCES conversations(id) ON DELETE CASCADE,
+          sender_id INTEGER REFERENCES users(id),
+          parent_id INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+          content TEXT NOT NULL,
+          message_type TEXT DEFAULT 'text', -- 'text', 'image', 'file', 'voice', 'system'
+          attachment_url TEXT,
+          attachment_name TEXT,
+          attachment_size INTEGER,
+          is_edited INTEGER DEFAULT 0,
+          is_deleted INTEGER DEFAULT 0,
+          is_pinned INTEGER DEFAULT 0,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS message_reactions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          message_id INTEGER REFERENCES messages(id) ON DELETE CASCADE,
+          user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+          reaction TEXT NOT NULL, -- emoji like '👍', '❤️', '😂'
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE(message_id, user_id, reaction)
+        );
+
+        CREATE TABLE IF NOT EXISTS message_reads (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          message_id INTEGER REFERENCES messages(id) ON DELETE CASCADE,
+          user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+          read_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE(message_id, user_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS typing_indicators (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          conversation_id INTEGER REFERENCES conversations(id) ON DELETE CASCADE,
+          user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+          is_typing INTEGER DEFAULT 0,
+          updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE(conversation_id, user_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS user_presence (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id INTEGER UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+          status TEXT DEFAULT 'offline', -- 'online', 'away', 'busy', 'offline'
+          last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+          updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS emergency_alerts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          school_id INTEGER DEFAULT 1,
+          title TEXT NOT NULL,
+          message TEXT NOT NULL,
+          severity TEXT DEFAULT 'high', -- 'low', 'medium', 'high', 'critical'
+          target_audience TEXT, -- 'all', 'teachers', 'students', 'parents', 'staff'
+          target_class TEXT,
+          sent_by INTEGER REFERENCES users(id),
+          sent_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          expires_at DATETIME
+        );
+
+        CREATE TABLE IF NOT EXISTS moderation_actions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          action_type TEXT NOT NULL, -- 'warn', 'mute', 'ban', 'delete_message', 'flag'
+          target_user_id INTEGER REFERENCES users(id),
+          target_message_id INTEGER REFERENCES messages(id),
+          moderator_id INTEGER REFERENCES users(id),
+          reason TEXT,
+          expires_at DATETIME,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS audit_logs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id INTEGER REFERENCES users(id),
+          action TEXT NOT NULL,
+          entity_type TEXT,
+          entity_id INTEGER,
+          old_value TEXT,  -- JSONB modelled as TEXT on SQLite
+          new_value TEXT,  -- JSONB modelled as TEXT on SQLite
+          ip_address TEXT,
+          user_agent TEXT,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- Indexes for communication tables
+        CREATE INDEX IF NOT EXISTS idx_conversations_school ON conversations(school_id);
+        CREATE INDEX IF NOT EXISTS idx_conversation_members_user ON conversation_members(user_id);
+        CREATE INDEX IF NOT EXISTS idx_conversation_members_conv ON conversation_members(conversation_id);
+        CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id);
+        CREATE INDEX IF NOT EXISTS idx_message_reactions_msg ON message_reactions(message_id);
+        CREATE INDEX IF NOT EXISTS idx_message_reads_msg ON message_reads(message_id);
+        CREATE INDEX IF NOT EXISTS idx_typing_conv ON typing_indicators(conversation_id);
+        CREATE INDEX IF NOT EXISTS idx_presence_user ON user_presence(user_id);
   `);
 
   // Seed default admin if none exists
@@ -249,6 +372,53 @@ function initTables() {
     ins.run('address', 'Ntinda, Kampala, Uganda');
     console.log('✓ SQLite site_settings seeded');
   }
+
+  // Seed subjects (mirrors the Postgres seed block in server.js — that
+  // block only runs when DATABASE_URL starts with 'postgres', so the
+  // local SQLite dev path needs its own seed or /api/subjects returns []).
+  const subjCount = db.prepare("SELECT COUNT(*) AS c FROM subjects").get().c;
+  if (subjCount === 0) {
+    const insSubj = db.prepare("INSERT INTO subjects (name, code, category, level) VALUES (?, ?, ?, ?)");
+    const subjects = [
+      ['Mathematics', 'MATH', 'Mathematics', 'O Level'], ['English', 'ENG', 'Languages', 'O Level'],
+      ['Physics', 'PHY', 'Sciences', 'A Level'], ['Chemistry', 'CHEM', 'Sciences', 'A Level'],
+      ['Biology', 'BIO', 'Sciences', 'O Level'], ['Geography', 'GEO', 'Humanities', 'O Level'],
+      ['History', 'HIST', 'Humanities', 'O Level'], ['CRE', 'CRE', 'Humanities', 'O Level'],
+      ['Agriculture', 'AGR', 'Applied', 'O Level'], ['ICT', 'ICT', 'Applied', 'O Level']
+    ];
+    for (const [name, code, cat, lvl] of subjects) insSubj.run(name, code, cat, lvl);
+    console.log('✓ SQLite subjects seeded');
+  }
+
+  // Seed classes (S.1..S.6 streams A/B) + teacher_classes so the
+  // teacher dashboard's "my students" view and /api/classes work
+  // out-of-the-box. Mirrors the Postgres seed block in server.js.
+  const classCount = db.prepare("SELECT COUNT(*) AS c FROM classes").get().c;
+  if (classCount === 0) {
+    const insClass = db.prepare("INSERT OR IGNORE INTO classes (name, stream, level, year) VALUES (?, ?, ?, ?)");
+    const year = new Date().getFullYear();
+    const classRows = [
+      ['S.1', 'A'], ['S.1', 'B'], ['S.2', 'A'], ['S.2', 'B'],
+      ['S.3', 'A'], ['S.3', 'B'], ['S.4', 'A'], ['S.4', 'B'],
+      ['S.5', 'A'], ['S.5', 'B'], ['S.6', 'A'], ['S.6', 'B'],
+    ];
+    for (const [name, stream] of classRows) {
+      insClass.run(name, stream, 'O Level', year);
+    }
+    // Wire each teacher to two classes so /api/teacher/students returns data
+    // the moment a teacher logs in. SQLite-translated SQL via this DbWrapper
+    // isn't reachable from inside initTables() — use better-sqlite3 directly.
+    const teachers = db.prepare("SELECT id FROM teachers ORDER BY id").all();
+    const classes = db.prepare("SELECT id, name, stream FROM classes ORDER BY id").all();
+    const insTc = db.prepare("INSERT INTO teacher_classes (teacher_id, class, stream, subject, year) VALUES (?, ?, ?, ?, ?)");
+    teachers.forEach((t, idx) => {
+      const a = classes[idx * 2 % classes.length];
+      const b = classes[(idx * 2 + 1) % classes.length];
+      if (a) insTc.run(t.id, a.name, a.stream, 'Mathematics', year);
+      if (b) insTc.run(t.id, b.name, b.stream, 'Mathematics', year);
+    });
+    console.log('✓ SQLite classes + teacher_classes seeded');
+  }
 }
 
 function convertPlaceholders(sql, params) {
@@ -267,8 +437,12 @@ function convertPlaceholders(sql, params) {
   if (params.length === 1 && Array.isArray(params[0])) params = params[0];
 
   if (!/\$/.test(sql)) {
-    // No Postgres placeholders — params are already in correct shape
-    return { sql, params };
+    // No Postgres placeholders — params are already in correct shape.
+    // Coerce JS booleans to 0/1 for SQLite (better-sqlite3 throws
+    // "SQLite3 can only bind numbers, strings, bigints, buffers, and null"
+    // if it sees a raw boolean — happens on `published: true` from the
+    // /api/admin/news body, for example).
+    return { sql, params: params.map(_toSqliteValue) };
   }
 
   // Build a parallel walk: emit one `?` per `$N` occurrence AND duplicate
@@ -277,10 +451,24 @@ function convertPlaceholders(sql, params) {
   const converted = sql.replace(/\$(\d+)/g, (_m, n) => {
     const idx = parseInt(n, 10) - 1;
     const val = idx >= 0 && idx < params.length ? params[idx] : null;
-    newParams.push(val === undefined ? null : val);
+    newParams.push(_toSqliteValue(val === undefined ? null : val));
     return '?';
   });
   return { sql: converted, params: newParams };
+}
+
+// Coerce a JS value into one of better-sqlite3's accepted bind types.
+// Booleans become 0/1 (SQLite has no boolean type; the column is INTEGER).
+// Dates pass through as their ISO string so SQLite stores TEXT — that's
+// what the existing schema declares (DATETIME columns stored as ISO).
+// Arrays become JSON-encoded strings (SQLite TEXT[] columns are modelled
+// as JSON TEXT). An empty array would otherwise spread into zero bind
+// args and produce "Too few parameter values were provided" — bind NULL.
+function _toSqliteValue(v) {
+  if (typeof v === 'boolean') return v ? 1 : 0;
+  if (v instanceof Date) return v.toISOString();
+  if (Array.isArray(v)) return v.length ? JSON.stringify(v) : null;
+  return v;
 }
 
 // Translate Postgres-flavoured SQL to SQLite on the fly.
@@ -295,12 +483,16 @@ function translateSqlite(sql) {
   // NOW() → CURRENT_TIMESTAMP (both return the same instant)
   s = s.replace(/\bNOW\s*\(\s*\)/gi, "CURRENT_TIMESTAMP");
 
-  // INTERVAL '<n> <unit>' → datetime('now', '-<n> <unit>')
-  // e.g. NOW() - INTERVAL '30 days'  →  datetime('now', '-30 days')
-  s = s.replace(
-    /INTERVAL\s+'(\d+)\s+(microseconds?|milliseconds?|seconds?|minutes?|hours?|days?|weeks?|months?|years?)'/gi,
-    (_m, n, unit) => `'${n} ${unit.toLowerCase()}s'`
-  );
+  // INTERVAL '<n> <unit>' → '<n> <unit>s'
+    // e.g. NOW() - INTERVAL '30 days'  →  CURRENT_TIMESTAMP - '30 days'
+    // Preserve the original plural ('days' stays 'days') and singular ('day'
+    // becomes 'days'). Earlier this unconditionally appended 's', turning
+    // 'days' into 'dayss', which SQLite treated as a bare string literal and
+    // broke the date math (newAdmissions filter returning 0).
+    s = s.replace(
+      /INTERVAL\s+'(\d+)\s+(\w+)'/gi,
+      (_m, n, unit) => `'${n} ${/s$/i.test(unit) ? unit : unit.toLowerCase() + 's'}'`
+    );
   // After the above, rewrite `CURRENT_TIMESTAMP - '30 days'` → `datetime('now', '-30 days')`
   s = s.replace(
     /CURRENT_TIMESTAMP\s*-\s*'(\d+)\s+(\w+)'/gi,

@@ -35,11 +35,18 @@ if (!dbUrl || dbUrl.startsWith('sqlite')) {
 }
 const { getDb } = require('./db');
 
+// Helper to detect SQLite vs PostgreSQL
+const isSqlite = () => !dbUrl || dbUrl.startsWith('sqlite');
+
+// Serve frontend from Express FIRST (before helmet) - bypasses Windows file-handle issue
+const frontendPath = path.join(__dirname, '..', 'frontend');
+app.use(express.static(frontendPath, { maxAge: '1h', etag: true }));
+
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors({
-  origin: process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : ['http://localhost:3000', 'http://localhost:5500'],
+  origin: process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : ['http://localhost:3000', 'http://localhost:5500', 'http://localhost:5501', 'http://127.0.0.1:3000', 'http://127.0.0.1:5500', 'http://127.0.0.1:5501'],
   credentials: true
-}));
+}))
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true }));
 
@@ -1388,6 +1395,483 @@ io.on('connection', (socket) => {
     await pool.query('INSERT INTO notifications (user_id,type,title,message) VALUES ($1,$2,$3,$4)', [user_id, type, title, message]).catch(err => console.error('Socket notification error:', err));
     io.to(`user_${user_id}`).emit('notification', { type, title, message });
   });
+});
+
+// ── Communication Center API Endpoints ───────────────────
+
+// Get user's conversations
+app.get('/api/conversations', authenticate, async (req, res) => {
+  try {
+    if (isSqlite()) {
+      // SQLite compatible version - no json_build_object
+      const result = await pool.query(`
+        SELECT c.*, 
+          (
+            SELECT json_group_array(
+              json_object(
+                'id', u.id, 'first_name', u.first_name, 'last_name', u.last_name,
+                'role', u.role, 'avatar_url', u.avatar_url, 'class', u.class, 'stream', u.stream
+              )
+            )
+            FROM conversation_members cm2
+            JOIN users u ON u.id = cm2.user_id
+            WHERE cm2.conversation_id = c.id
+          ) as members,
+          (
+            SELECT json_object(
+              'id', m.id, 'content', m.content, 'sender_id', m.sender_id,
+              'sender_first', u2.first_name, 'sender_last', u2.last_name,
+              'created_at', m.created_at, 'read_count', 0
+            )
+            FROM messages m
+            JOIN users u2 ON u2.id = m.sender_id
+            WHERE m.conversation_id = c.id
+            ORDER BY m.created_at DESC
+            LIMIT 1
+          ) as last_message,
+          (
+            SELECT COUNT(*) FROM messages m2
+            WHERE m2.conversation_id = c.id AND m2.sender_id != ? AND m2.is_read = 0
+          ) as unread_count
+        FROM conversations c
+        JOIN conversation_members cm ON cm.conversation_id = c.id
+        WHERE cm.user_id = ? AND c.is_archived = 0
+        ORDER BY COALESCE(c.updated_at, c.created_at) DESC
+      `, [req.user.id, req.user.id]);
+      return res.json(result.rows);
+    }
+
+    const result = await pool.query(`
+      SELECT c.*, 
+        COALESCE(
+          json_agg(json_build_object(
+            'id', u.id, 'first_name', u.first_name, 'last_name', u.last_name, 
+            'role', u.role, 'avatar_url', u.avatar_url, 'class', u.class, 'stream', u.stream
+          )) FILTER (WHERE u.id IS NOT NULL), '[]'
+        ) as members,
+        (
+          SELECT json_build_object(
+            'id', m.id, 'content', m.content, 'sender_id', m.sender_id,
+            'sender_first', u2.first_name, 'sender_last', u2.last_name,
+            'created_at', m.created_at, 'read_count', 0
+          )
+          FROM messages m
+          JOIN users u2 ON u2.id = m.sender_id
+          WHERE m.conversation_id = c.id
+          ORDER BY m.created_at DESC
+          LIMIT 1
+        ) as last_message,
+        (
+          SELECT COUNT(*) FROM messages m2
+          WHERE m2.conversation_id = c.id AND m2.sender_id != $1 AND m2.is_read = false
+        ) as unread_count
+      FROM conversations c
+      JOIN conversation_members cm ON cm.conversation_id = c.id
+      LEFT JOIN users u ON u.id = cm.user_id
+      WHERE cm.user_id = $1 AND c.is_archived = false
+      GROUP BY c.id
+      ORDER BY c.updated_at DESC NULLS LAST, c.created_at DESC
+    `, [req.user.id]);
+    res.json(result.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Get single conversation with messages
+app.get('/api/conversations/:id', authenticate, async (req, res) => {
+  try {
+    const conv = await pool.query(`
+      SELECT c.*, 
+        COALESCE(
+          json_agg(json_build_object(
+            'id', u.id, 'first_name', u.first_name, 'last_name', u.last_name, 
+            'role', u.role, 'avatar_url', u.avatar_url
+          )) FILTER (WHERE u.id IS NOT NULL), '[]'
+        ) as members
+      FROM conversations c
+      LEFT JOIN conversation_members cm ON cm.conversation_id = c.id
+      LEFT JOIN users u ON u.id = cm.user_id
+      WHERE c.id = $1
+      GROUP BY c.id
+    `, [req.params.id]);
+    
+    if (!conv.rows[0]) return res.status(404).json({ error: 'Conversation not found' });
+    
+    const messages = await pool.query(`
+      SELECT m.*, u.first_name as sender_first, u.last_name as sender_last, u.avatar_url as sender_avatar
+      FROM messages m
+      JOIN users u ON u.id = m.sender_id
+      WHERE m.conversation_id = $1 AND m.is_deleted = false
+      ORDER BY m.created_at ASC
+      LIMIT 50
+    `, [req.params.id]);
+    
+    conv.rows[0].messages = messages.rows;
+    res.json(conv.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Create conversation
+app.post('/api/conversations', authenticate, async (req, res) => {
+  try {
+    const { type, name, description, member_ids } = req.body;
+    if (!type || !['direct', 'group', 'class', 'announcement'].includes(type)) {
+      return res.status(400).json({ error: 'Invalid conversation type' });
+    }
+    if (!member_ids || !Array.isArray(member_ids) || member_ids.length === 0) {
+      return res.status(400).json({ error: 'Member IDs required' });
+    }
+    
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      
+      const convResult = await client.query(`
+        INSERT INTO conversations (type, name, description, created_by, school_id)
+        VALUES ($1, $2, $3, $4, 1) RETURNING *
+      `, [type, name || null, description || null, req.user.id]);
+      
+      const conversation = convResult.rows[0];
+      
+      // Add creator as admin
+      await client.query(`
+        INSERT INTO conversation_members (conversation_id, user_id, role)
+        VALUES ($1, $2, 'admin')
+      `, [conversation.id, req.user.id]);
+      
+      // Add other members
+      for (const memberId of member_ids) {
+        if (memberId != req.user.id) {
+          await client.query(`
+            INSERT INTO conversation_members (conversation_id, user_id, role)
+            VALUES ($1, $2, 'member')
+            ON CONFLICT (conversation_id, user_id) DO NOTHING
+          `, [conversation.id, memberId]);
+        }
+      }
+      
+      await client.query('COMMIT');
+      
+      // Emit to all members
+      const memberIds = [req.user.id, ...member_ids.filter(id => id != req.user.id)];
+      memberIds.forEach(id => io.to(`user_${id}`).emit('conversation_created', conversation));
+      
+      res.json({ conversation });
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Get conversation messages
+app.get('/api/conversations/:id/messages', authenticate, async (req, res) => {
+  try {
+    const { limit = 50, before } = req.query;
+    let query = `
+      SELECT m.*, u.first_name as sender_first, u.last_name as sender_last, u.avatar_url as sender_avatar
+      FROM messages m
+      JOIN users u ON u.id = m.sender_id
+      WHERE m.conversation_id = $1 AND m.is_deleted = false
+    `;
+    const params = [req.params.id];
+    
+    if (before) {
+      params.push(before);
+      query += ` AND m.created_at < $${params.length}`;
+    }
+    
+    query += ` ORDER BY m.created_at DESC LIMIT $${params.length + 1}`;
+    params.push(parseInt(limit));
+    
+    const result = await pool.query(query, params);
+    res.json(result.rows.reverse());
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Send message
+app.post('/api/conversations/:id/messages', authenticate, async (req, res) => {
+  try {
+    const { content, message_type, attachment_url, attachment_name, attachment_size, parent_id } = req.body;
+    if (!content && !attachment_url) {
+      return res.status(400).json({ error: 'Message content or attachment required' });
+    }
+    
+    const result = await pool.query(`
+      INSERT INTO messages (conversation_id, sender_id, content, message_type, 
+        attachment_url, attachment_name, attachment_size, parent_id)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *
+    `, [req.params.id, req.user.id, content || '', message_type || 'text', 
+        attachment_url || null, attachment_name || null, attachment_size || null, parent_id || null]);
+    
+    const message = result.rows[0];
+    
+    // Update conversation updated_at
+    await pool.query(`UPDATE conversations SET updated_at = NOW() WHERE id = $1`, [req.params.id]);
+    
+    // Get sender info
+    const sender = await pool.query('SELECT first_name, last_name, avatar_url FROM users WHERE id = $1', [req.user.id]);
+    message.sender_first = sender.rows[0]?.first_name;
+    message.sender_last = sender.rows[0]?.last_name;
+    message.sender_avatar = sender.rows[0]?.avatar_url;
+    
+    // Emit to conversation members
+    const members = await pool.query('SELECT user_id FROM conversation_members WHERE conversation_id = $1', [req.params.id]);
+    members.rows.forEach(m => {
+      if (m.user_id != req.user.id) {
+        io.to(`user_${m.user_id}`).emit('new_message', message);
+      }
+    });
+    
+    res.json({ message });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Mark conversation as read
+app.put('/api/conversations/:id/read-all', authenticate, async (req, res) => {
+  try {
+    await pool.query(`
+      UPDATE messages SET is_read = true 
+      WHERE conversation_id = $1 AND sender_id != $2 AND is_read = false
+    `, [req.params.id, req.user.id]);
+    
+    await pool.query(`
+      INSERT INTO message_reads (message_id, user_id)
+      SELECT m.id, $2 FROM messages m
+      WHERE m.conversation_id = $1 AND m.sender_id != $2
+      ON CONFLICT (message_id, user_id) DO NOTHING
+    `, [req.params.id, req.user.id]);
+    
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Add reaction
+app.post('/api/messages/:id/reactions', authenticate, async (req, res) => {
+  try {
+    const { reaction } = req.body;
+    if (!reaction) return res.status(400).json({ error: 'Reaction required' });
+    
+    const result = await pool.query(`
+      INSERT INTO message_reactions (message_id, user_id, reaction)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (message_id, user_id, reaction) DO NOTHING
+      RETURNING *
+    `, [req.params.id, req.user.id, reaction]);
+    
+    if (result.rows[0]) {
+      io.emit('message_reaction_added', { message_id: req.params.id, reaction, user_id: req.user.id });
+    }
+    res.json({ reaction: result.rows[0] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Remove reaction
+app.delete('/api/messages/:id/reactions', authenticate, async (req, res) => {
+  try {
+    const { reaction } = req.body;
+    await pool.query('DELETE FROM message_reactions WHERE message_id = $1 AND user_id = $2 AND reaction = $3', 
+      [req.params.id, req.user.id, reaction]);
+    io.emit('message_reaction_removed', { message_id: req.params.id, reaction, user_id: req.user.id });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Typing indicator
+app.post('/api/conversations/:id/typing', authenticate, async (req, res) => {
+  try {
+    const { is_typing } = req.body;
+    await pool.query(`
+      INSERT INTO typing_indicators (conversation_id, user_id, is_typing)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (conversation_id, user_id) 
+      DO UPDATE SET is_typing = $3, updated_at = NOW()
+    `, [req.params.id, req.user.id, is_typing]);
+    
+    if (req.socket) {
+      req.socket.to(`conversation_${req.params.id}`).emit('typing', { 
+        conversation_id: req.params.id, 
+        user_id: req.user.id, 
+        is_typing 
+      });
+    }
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Update presence
+app.put('/api/presence', authenticate, async (req, res) => {
+  try {
+    const { status } = req.body;
+    await pool.query(`
+      INSERT INTO user_presence (user_id, status)
+      VALUES ($1, $2)
+      ON CONFLICT (user_id) DO UPDATE SET status = $2, updated_at = NOW()
+    `, [req.user.id, status || 'online']);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Get presence
+app.get('/api/presence', authenticate, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT user_id, status, last_seen FROM user_presence');
+    res.json(result.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Emergency alerts
+app.get('/api/emergency-alerts', authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT ea.*, u.first_name, u.last_name 
+      FROM emergency_alerts ea
+      LEFT JOIN users u ON u.id = ea.sent_by
+      WHERE ea.expires_at IS NULL OR ea.expires_at > NOW()
+      ORDER BY ea.severity DESC, ea.created_at DESC
+    `);
+    res.json(result.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/emergency-alerts', authenticate, requireRole('admin', 'super_admin'), async (req, res) => {
+  try {
+    const { title, message, severity, target_audience, target_class, expires_at } = req.body;
+    const result = await pool.query(`
+      INSERT INTO emergency_alerts (title, message, severity, target_audience, target_class, sent_by, expires_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *
+    `, [title, message, severity || 'high', target_audience || 'all', target_class || null, req.user.id, expires_at || null]);
+    
+    io.emit('emergency_alert', result.rows[0]);
+    res.json({ alert: result.rows[0] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Directory - search users
+app.get('/api/directory', authenticate, async (req, res) => {
+  try {
+    const { role, class: cls, limit = 100 } = req.query;
+    let query = 'SELECT id, username, first_name, last_name, email, phone, role, class, stream, avatar_url FROM users WHERE 1=1';
+    const params = [];
+    
+    if (role) { params.push(role); query += ` AND role = $${params.length}`; }
+    if (cls) { params.push(cls); query += ` AND class = $${params.length}`; }
+    
+    query += ` ORDER BY first_name, last_name LIMIT $${params.length + 1}`;
+    params.push(parseInt(limit));
+    
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Search
+app.get('/api/search', authenticate, async (req, res) => {
+  try {
+    const { q, type } = req.query;
+    if (!q || q.length < 2) return res.json({ users: [], conversations: [], messages: [] });
+    
+    const searchTerm = `%${q}%`;
+    const results = { users: [], conversations: [], messages: [] };
+    
+    const users = await pool.query(`
+      SELECT id, username, first_name, last_name, email, role, avatar_url
+      FROM users 
+      WHERE (first_name ILIKE $1 OR last_name ILIKE $1 OR username ILIKE $1 OR email ILIKE $1)
+      AND role != 'super_admin'
+      LIMIT 20
+    `, [searchTerm]);
+    results.users = users.rows;
+    
+    if (type !== 'users') {
+      const convs = await pool.query(`
+        SELECT DISTINCT c.id, c.name, c.type, c.updated_at
+        FROM conversations c
+        JOIN conversation_members cm ON cm.conversation_id = c.id
+        WHERE cm.user_id = $1 AND c.name ILIKE $2
+        ORDER BY c.updated_at DESC
+        LIMIT 10
+      `, [req.user.id, searchTerm]);
+      results.conversations = convs.rows;
+    }
+    
+    if (type !== 'users' && type !== 'conversations') {
+      const msgs = await pool.query(`
+        SELECT m.*, c.name as conversation_name, u.first_name, u.last_name
+        FROM messages m
+        JOIN conversations c ON c.id = m.conversation_id
+        JOIN users u ON u.id = m.sender_id
+        JOIN conversation_members cm ON cm.conversation_id = c.id
+        WHERE cm.user_id = $1 AND m.content ILIKE $2 AND m.is_deleted = false
+        ORDER BY m.created_at DESC
+        LIMIT 20
+      `, [req.user.id, searchTerm]);
+      results.messages = msgs.rows;
+    }
+    
+    res.json(results);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Moderation actions (admin only)
+app.get('/api/admin/moderation', authenticate, requireRole('admin', 'super_admin'), async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT ma.*, u1.first_name as target_first, u1.last_name as target_last,
+        u2.first_name as mod_first, u2.last_name as mod_last
+      FROM moderation_actions ma
+      LEFT JOIN users u1 ON u1.id = ma.target_user_id
+      LEFT JOIN users u2 ON u2.id = ma.moderator_id
+      ORDER BY ma.created_at DESC
+      LIMIT 100
+    `);
+    res.json(result.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/admin/moderation', authenticate, requireRole('admin', 'super_admin'), async (req, res) => {
+  try {
+    const { action_type, target_user_id, target_message_id, reason, expires_at } = req.body;
+    const result = await pool.query(`
+      INSERT INTO moderation_actions (action_type, target_user_id, target_message_id, reason, moderator_id, expires_at)
+      VALUES ($1, $2, $3, $4, $5, $6) RETURNING *
+    `, [action_type, target_user_id, target_message_id || null, reason, req.user.id, expires_at || null]);
+    
+    io.emit('moderation_action', result.rows[0]);
+    res.json({ action: result.rows[0] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Audit logs (admin only)
+app.get('/api/admin/audit-logs', authenticate, requireRole('admin', 'super_admin'), async (req, res) => {
+  try {
+    const { limit = 100, user_id, action } = req.query;
+    let query = `
+      SELECT al.*, u.first_name, u.last_name, u.username
+      FROM audit_logs al
+      LEFT JOIN users u ON u.id = al.user_id
+      WHERE 1=1
+    `;
+    const params = [];
+    
+    if (user_id) { params.push(user_id); query += ` AND al.user_id = $${params.length}`; }
+    if (action) { params.push(action); query += ` AND al.action = $${params.length}`; }
+    
+    query += ` ORDER BY al.created_at DESC LIMIT $${params.length + 1}`;
+    params.push(parseInt(limit));
+    
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Announcements audiences (for admin)
+app.get('/api/announcements/audiences', authenticate, requireRole('admin', 'teacher'), async (req, res) => {
+  try {
+    const result = await pool.query(`SELECT DISTINCT audience FROM announcements WHERE audience IS NOT NULL`);
+    res.json(result.rows.map(r => r.audience));
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // Static files
